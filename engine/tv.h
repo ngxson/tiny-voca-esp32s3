@@ -76,6 +76,9 @@ typedef struct {
     // vocoder heads
     tv_linear harmonic, noise;
     float s_voc;
+    // Read from the file so one engine runs any language: token and voice counts come from the
+    // embedding shapes, the first vowel id from the optional `meta.first_vowel` (English: 43).
+    int n_vocab, n_voices, first_vowel;
     char error[128];
 } tv_model;
 
