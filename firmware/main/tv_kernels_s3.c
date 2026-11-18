@@ -9,9 +9,10 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-void dot_rows_s8_accx(const int8_t *x, const int8_t *W, int32_t *out, int N, int k16);
-void dot48_rows_accx(const int8_t *q, const int8_t *K, int32_t *out, int N);
 void qacc_mm_s8(const int8_t *x, const int8_t *wblk, const uint8_t *raw_in, uint8_t *raw_out, int k32);
+int32_t attn_max48(const int8_t *q, const int8_t *K, int n, int32_t m);
+int32_t attn_weights48(const int8_t *q, const int8_t *K, int n, int32_t m, const uint32_t *lut_lim, int8_t *w);
+void attn_pv64(const int8_t *w, const int8_t *v, int32_t *acc);
 
 uint64_t tv_time_us(void) { return (uint64_t)esp_timer_get_time(); }
 
@@ -27,6 +28,15 @@ void *tv_alloc(size_t n) {
 }
 
 void tv_free(void *p) { heap_caps_free(p); }
+
+// Internal RAM, as long as 64 KB of it stays free for the system. Inputs read from there leave the
+// external memory bus to the matmul weights streaming from flash.
+void *tv_alloc_fast(size_t n) {
+    void *p = NULL;
+    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) > n + 64 * 1024)
+        p = heap_caps_aligned_alloc(16, n + 64, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    return p ? p : tv_alloc(n);
+}
 
 // ---------------------------------------------------------------- QACC raw layout
 static void pack_qacc(const int32_t *v, uint8_t *raw) {      // 16 values (20-bit) -> 64 bytes
@@ -104,33 +114,59 @@ typedef struct {
     long saturations;
 } mm_job;
 
+// Lanes sitting on a 20-bit rail (saturated). |v| reaches TV_QACC_MAX only on the rails, so one
+// max over the 16 lanes rules out the common case.
+static inline long rail_count(const int32_t *v, int width) {
+    int32_t m = 0;
+    for (int i = 0; i < 16; i++) {
+        int32_t u = v[i] ^ (v[i] >> 31);
+        m = u > m ? u : m;
+    }
+    if (m < TV_QACC_MAX) return 0;
+    long n = 0;
+    for (int i = 0; i < width; i++) n += v[i] == TV_QACC_MAX || v[i] == -TV_QACC_MAX - 1;
+    return n;
+}
+
+// total[i] = sum over chunks of (lane - preload) for one row of block nb; returns saturated lanes.
+static inline __attribute__((always_inline)) long mm_row(const tv_linear *L, const backend *be, const int8_t *xt,
+                                                         const int8_t *wb, int nb, int nblocks, int width, int32_t *total) {
+    uint8_t raw[64] __attribute__((aligned(16)));
+    if (L->chunks == 1 && !be->raw_pre) {       // every layer but project
+        qacc_mm_s8(xt, wb, zero_raw, raw, L->K / 32);
+        unpack_qacc(raw, total);
+        return rail_count(total, width);
+    }
+    const int chunk = L->K / L->chunks;
+    long sat = 0;
+    for (int c = 0; c < L->chunks; c++) {
+        int32_t lanes[16];
+        const size_t at = (size_t)c * nblocks + nb;
+        qacc_mm_s8(xt + c * chunk, wb + (size_t)c * chunk * 16, be->raw_pre ? be->raw_pre + at * 64 : zero_raw, raw, chunk / 32);
+        unpack_qacc(raw, lanes);
+        sat += rail_count(lanes, width);
+        const int32_t *pre = be->pre ? be->pre + at * 16 : NULL;
+        for (int i = 0; i < 16; i++) total[i] = (c ? total[i] : 0) + lanes[i] - (pre ? pre[i] : 0);
+    }
+    return sat;
+}
+
 static void mm_run(void *arg) {
     mm_job *j = arg;
     const tv_linear *L = j->L;
     const backend *be = L->backend;
-    const int K = L->K, N = L->N, chunk = K / L->chunks, nblocks = (N + 15) / 16;
-    uint8_t raw[64] __attribute__((aligned(16)));
-    int32_t lanes[16], total[16];
+    const int K = L->K, N = L->N, nblocks = (N + 15) / 16;
+    const tv_epilogue *e = j->e;
     long sat = 0;
     for (int nb = j->nb0; nb < j->nb1; nb++) {
         const int8_t *wb = L->wq + (size_t)nb * K * 16;
         const int width = N - nb * 16 < 16 ? N - nb * 16 : 16;
         const float *scale = be->scale + nb * 16, *bias = L->bias + nb * 16;
+        int32_t total[16];
         for (int t = 0; t < j->T; t++) {
             const int8_t *xt = j->x + (size_t)t * K;
-            for (int c = 0; c < L->chunks; c++) {
-                const uint8_t *init = be->raw_pre ? be->raw_pre + ((size_t)c * nblocks + nb) * 64 : zero_raw;
-                qacc_mm_s8(xt + c * chunk, wb + (size_t)c * chunk * 16, init, raw, chunk / 32);
-                unpack_qacc(raw, lanes);
-                const int32_t *pre = be->pre ? be->pre + ((size_t)c * nblocks + nb) * 16 : NULL;
-                for (int i = 0; i < width; i++) {
-                    int32_t v = lanes[i];
-                    sat += v == TV_QACC_MAX || v == -TV_QACC_MAX - 1;
-                    total[i] = (c ? total[i] : 0) + v - (pre ? pre[i] : 0);
-                }
-            }
+            sat += mm_row(L, be, xt, wb, nb, nblocks, width, total);
             const size_t at = (size_t)t * N + nb * 16;
-            const tv_epilogue *e = j->e;
             if (e->mode == TV_EPI_STORE) {
                 float *yt = (float *)j->out + at;
                 for (int i = 0; i < width; i++) yt[i] = (float)total[i] * scale[i] + bias[i];
@@ -190,7 +226,23 @@ long tv_linear_run(const tv_linear *L, const int8_t *x, int T, void *out, const 
     return a.saturations + b.saturations;
 }
 
-void tv_dot_rows_i8(const int8_t *x, const int8_t *W, int N, int K, int32_t *out) {
-    if (K == 48) { dot48_rows_accx(x, W, out, N); return; }       // attention scores: query held in registers
-    dot_rows_s8_accx(x, W, out, N, K / 16);
+// ---------------------------------------------------------------- attention (one head, dim 48)
+int32_t tv_attn_max48(const int8_t *q, const int8_t *K, int n, int32_t m) { return attn_max48(q, K, n, m); }
+
+int32_t tv_attn_weights48(const int8_t *q, const int8_t *K, int n, int32_t m, const uint8_t *lut, uint32_t lim, int8_t *w) {
+    const uint32_t lut_lim[2] = {(uint32_t)lut, lim};
+    return attn_weights48(q, K, n, m, lut_lim, w);
+}
+
+static inline int any_nonzero64(const int8_t *w) {
+    const uint32_t *p = (const uint32_t *)w;
+    uint32_t o = 0;
+    for (int i = 0; i < 16; i++) o |= p[i];
+    return o != 0;
+}
+
+// Most weights of a peaked attention row are 0: skip the 64-key halves that are all zero.
+void tv_attn_pv48(const int8_t *w, const int8_t *v, int32_t *acc) {
+    if (any_nonzero64(w)) attn_pv64(w, v, acc);
+    if (any_nonzero64(w + 64)) attn_pv64(w + 64, v + 64, acc);
 }

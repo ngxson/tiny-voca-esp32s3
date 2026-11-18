@@ -16,11 +16,21 @@
 #define HARMONIC_LIMIT 0.47
 
 // ---------------------------------------------------------------- fast float math
+// rintf and floorf are library calls on the S3. These give the same values (round to nearest
+// even for |x| < 2^22, where adding 1.5 * 2^23 leaves no fraction bits; floor for 0 <= x < 2^23),
+// up to the sign of a zero rint, which none of the callers can see.
+static inline float rint_small(float x) { return (x + 12582912.0f) - 12582912.0f; }
+static inline float round_even(float x) { return fabsf(x) < 4194304.0f ? rint_small(x) : rintf(x); }
+static inline float floor_pos(float x) {
+    float t = (float)(int32_t)x;
+    return t > x ? t - 1.0f : t;
+}
+
 // exp: Cody-Waite reduction + degree-6 polynomial (~2 ulp). sincos: quadrant reduction + minimax.
 static inline float fast_expf(float x) {
     if (x < -87.0f) x = -87.0f;
     if (x > 88.0f) x = 88.0f;
-    float n = rintf(x * 1.44269504f);
+    float n = rint_small(x * 1.44269504f);
     float r = x - n * 0.693145752f - n * 1.42860677e-6f;
     float p = 1.0f + r * (1.0f + r * (0.5f + r * (0.166666672f + r * (0.0416666679f + r * (0.00833333377f + r * 0.00138888892f)))));
     union { float f; int32_t i; } u = {p};
@@ -29,7 +39,7 @@ static inline float fast_expf(float x) {
 }
 
 static inline void fast_sincosf(float x, float *s, float *c) {
-    float k = rintf(x * 0.636619772f);                  // quadrant
+    float k = round_even(x * 0.636619772f);             // quadrant
     float r = x - k * 1.57079601f - k * 3.13916473e-07f - k * 5.39030253e-15f;
     float r2 = r * r;
     float sn = r + r * r2 * (-0.166666657f + r2 * (0.00833330024f + r2 * -0.000198409713f));
@@ -157,9 +167,42 @@ static float lifter(int i, int first) {
 typedef struct {
     const float *f0;
     int T, s;                   // next sample index
-    double cycles;
+    uint64_t n;                 // the phase in units of 2^-52 while `inexact` is 0 (see phase_step)
+    double cycles;              // the phase once a step left that range
+    int inexact;
     float k0, k1;               // log f0 at this frame and the next
 } pulse_gen;
+
+// n < 2^52 times 2^-52, rounded to float (to nearest even), as (float)(double) would.
+static float u52_to_float(uint64_t n) {
+    if (n < (1u << 24)) return (float)(uint32_t)n * 0x1p-52f;
+    uint32_t hi = (uint32_t)(n >> 32);
+    int msb = hi ? 63 - __builtin_clz(hi) : 31 - __builtin_clz((uint32_t)n);
+    int sh = msb - 23;                                      // 1 .. 28
+    uint32_t mant = (uint32_t)(n >> sh);
+    uint64_t rem = n & ((1ULL << sh) - 1), half = 1ULL << (sh - 1);
+    if (rem > half || (rem == half && (mant & 1))) mant++;  // may reach 2^24, still exact
+    union { uint32_t u; float f; } scale = {(uint32_t)(127 + sh - 52) << 23};
+    return (float)mant * scale.f;
+}
+
+// cycles += step; if (cycles >= 1) cycles -= 1; returns (float)cycles. The S3 has no double
+// hardware, so this uses an integer: with every step in [2^-29, 1), all values are multiples of
+// 2^-52 below 2 and those double operations are exact, so the integer gives the same phases.
+// A step outside that range switches to doubles for good.
+static float phase_step(pulse_gen *g, float step) {
+    union { float f; uint32_t u; } a = {step};
+    uint32_t e = a.u >> 23;                                 // biased exponent; >= 256 if negative
+    if (!g->inexact && e >= 98 && e <= 126) {
+        g->n += (uint64_t)((a.u & 0x7FFFFF) | 0x800000) << (e - 98);
+        if (g->n >= 1ULL << 52) g->n -= 1ULL << 52;
+        return u52_to_float(g->n);
+    }
+    if (!g->inexact) { g->cycles = (double)g->n * 0x1p-52; g->inexact = 1; }
+    g->cycles += step;
+    if (g->cycles >= 1.0) g->cycles -= 1.0;
+    return (float)g->cycles;
+}
 
 static float pulse_next(pulse_gen *g) {
     int f = g->s / TV_HOP, i = g->s % TV_HOP;
@@ -172,18 +215,16 @@ static float pulse_next(pulse_gen *g) {
     g->s++;
     float w = (float)i / TV_HOP;
     float freq = fast_expf(g->k0 + (g->k1 - g->k0) * w);
-    g->cycles += freq * (1.0f / TV_SAMPLE_RATE);
-    if (g->cycles >= 1.0) g->cycles -= 1.0;
-    float phase = (float)g->cycles;                     // in [0, 1)
+    float phase = phase_step(g, freq * (1.0f / TV_SAMPLE_RATE));     // in [0, 1)
     float th = 6.28318531f * phase;
     float harmonics = (float)HARMONIC_LIMIT * TV_SAMPLE_RATE / freq;
     if (harmonics < 1) harmonics = 1;
-    float whole = floorf(harmonics);
+    float whole = floor_pos(harmonics);
     float s_half, c_half, s_core, c_core, s_top, c_top;
     fast_sincosf(0.5f * th, &s_half, &c_half);
     float u = (whole + 0.5f) * phase, v = (whole + 1.0f) * phase;     // reduce in cycles first
-    fast_sincosf(6.28318531f * (u - floorf(u)), &s_core, &c_core);
-    fast_sincosf(6.28318531f * (v - floorf(v)), &s_top, &c_top);
+    fast_sincosf(6.28318531f * (u - floor_pos(u)), &s_core, &c_core);
+    fast_sincosf(6.28318531f * (v - floor_pos(v)), &s_top, &c_top);
     float den = 2.0f * s_half;
     float core = fabsf(den) < 1e-7f ? whole : s_core / den - 0.5f;
     float wave = core + (harmonics - whole) * c_top;
@@ -272,18 +313,18 @@ static void response(branch *b, const sources *src, int j) {
 
 // Process the next frame; appends the samples that became final to the fifo.
 static void branch_step(branch *b, sources *src) {
-    const int fft_n = b->fft, hop = b->hop, m = b->m;
+    // win, ola and env are rings: logical index i is at (o + i) & mask, so nothing is shifted.
+    const int fft_n = b->fft, hop = b->hop, m = b->m, mask = fft_n - 1, o = (m * hop) & mask;
     if (m == 0) {
         for (int i = 0; i < fft_n; i++) b->win[i] = next_source(b, src);
     } else {
-        memmove(b->win, b->win + hop, (fft_n - hop) * sizeof(float));
-        for (int i = fft_n - hop; i < fft_n; i++) b->win[i] = next_source(b, src);
+        for (int i = fft_n - hop; i < fft_n; i++) b->win[(o + i) & mask] = next_source(b, src);
     }
     uint64_t t0 = tv_time_us();
     response(b, src, m);
     tv_prof[TV_P_VOC_CEP] += tv_time_us() - t0;
     t0 = tv_time_us();
-    for (int i = 0; i < fft_n; i++) b->seg[i] = b->win[i] * b->window[i];
+    for (int i = 0; i < fft_n; i++) b->seg[i] = b->win[(o + i) & mask] * b->window[i];
     rfft(b->seg, fft_n, b->re, b->im, b->tr, b->ti);
     for (int k = 0; k < b->bins; k++) {
         float x = b->re[k] * b->rr[k] - b->im[k] * b->ri[k], y = b->re[k] * b->ri[k] + b->im[k] * b->rr[k];
@@ -291,20 +332,19 @@ static void branch_step(branch *b, sources *src) {
     }
     irfft(b->re, b->im, fft_n, b->seg, b->tr, b->ti);
     for (int i = 0; i < fft_n; i++) {
-        b->ola[i] += b->seg[i] * b->window[i];
-        b->env[i] += b->win2[i];
+        int k = (o + i) & mask;
+        b->ola[k] += b->seg[i] * b->window[i];
+        b->env[k] += b->win2[i];
     }
     for (int i = 0; i < hop; i++) {                     // padded positions m*hop + i are final
-        int out = m * hop + i - b->P;
+        int out = m * hop + i - b->P, k = (o + i) & mask;
+        float e = b->env[k], v = b->ola[k];
+        b->ola[k] = 0.0f;                               // logical index fft_n - hop + i next frame
+        b->env[k] = 0.0f;
         if (out < 0 || out >= b->S) continue;
-        float e = b->env[i];
-        b->fifo[b->count++] = e > 1e-11f ? b->ola[i] / e : b->ola[i];
+        b->fifo[b->count++] = e > 1e-11f ? v / e : v;
         b->produced++;
     }
-    memmove(b->ola, b->ola + hop, (fft_n - hop) * sizeof(float));
-    memmove(b->env, b->env + hop, (fft_n - hop) * sizeof(float));
-    memset(b->ola + fft_n - hop, 0, hop * sizeof(float));
-    memset(b->env + fft_n - hop, 0, hop * sizeof(float));
     b->m++;
     tv_prof[TV_P_VOC_SHAPE] += tv_time_us() - t0;
 }
@@ -325,13 +365,14 @@ void tv_vocoder_stream(const float *h, const float *n, const float *f0, const fl
     const int S = T * TV_HOP;
     branch *hb = malloc(sizeof(branch)), *nb = malloc(sizeof(branch));
     float *out = malloc(VOC_BLOCK * sizeof(float));
-    sources src = {h, n, T, {f0, T, 0, 0, 0, 0}, noise, 0x9E3779B97F4A7C15ULL ^ (seed << 1 | 1), 0};
+    sources src = {h, n, T, {f0, T, 0, 0, 0.0, 0, 0, 0}, noise, 0x9E3779B97F4A7C15ULL ^ (seed << 1 | 1), 0};
     branch_init(hb, SYNTH_FFT, SYNTH_HOP, 1, S);
     branch_init(nb, NOISE_FFT, NOISE_HOP, 0, S);
     int emitted = 0;
     while (emitted < S) {
         // Both branches advance on their own core until they cover the next block.
-        int target = emitted + VOC_BLOCK < S ? emitted + VOC_BLOCK : S;
+        int block = emitted >= VOC_BLOCK / 2 ? VOC_BLOCK : emitted ? VOC_BLOCK / 2 : VOC_BLOCK / 4;  // short first blocks: sound starts sooner
+        int target = emitted + block < S ? emitted + block : S;
         branch_job jh = {hb, &src, target}, jn = {nb, &src, target};
         tv_parallel2(branch_run, &jh, &jn);
         int k = target - emitted;

@@ -22,6 +22,8 @@ void *tv_alloc(size_t n) {
 
 void tv_free(void *p) { free(p); }
 
+void *tv_alloc_fast(size_t n) { return tv_alloc(n); }
+
 void tv_kernels_init(void) {}
 int tv_linear_prepare(tv_linear *L) { (void)L; return 0; }
 void tv_linear_release(tv_linear *L) { (void)L; }
@@ -51,11 +53,34 @@ long tv_linear_run(const tv_linear *L, const int8_t *x, int T, void *out, const 
 
 void tv_parallel2(void (*fn)(void *), void *a, void *b) { fn(a); fn(b); }
 
-void tv_dot_rows_i8(const int8_t *x, const int8_t *W, int N, int K, int32_t *out) {
-    for (int n = 0; n < N; n++) {
-        const int8_t *w = W + (size_t)n * K;
+static int32_t dot48(const int8_t *q, const int8_t *k) {
+    int32_t s = 0;
+    for (int i = 0; i < 48; i++) s += q[i] * k[i];
+    return s;
+}
+
+int32_t tv_attn_max48(const int8_t *q, const int8_t *K, int n, int32_t m) {
+    for (int t = 0; t < n; t++) {
+        int32_t d = dot48(q, K + (size_t)t * 48);
+        if (d > m) m = d;
+    }
+    return m;
+}
+
+int32_t tv_attn_weights48(const int8_t *q, const int8_t *K, int n, int32_t m, const uint8_t *lut, uint32_t lim, int8_t *w) {
+    int32_t total = 0;
+    for (int t = 0; t < n; t++) {
+        uint32_t gap = (uint32_t)(m - dot48(q, K + (size_t)t * 48));
+        w[t] = (int8_t)lut[gap < lim ? gap : lim];
+        total += (uint8_t)w[t];
+    }
+    return total;
+}
+
+void tv_attn_pv48(const int8_t *w, const int8_t *v, int32_t *acc) {
+    for (int d = 0; d < 48; d++) {
         int32_t s = 0;
-        for (int k = 0; k < K; k++) s += x[k] * w[k];
-        out[n] = s;
+        for (int t = 0; t < 128; t++) s += w[t] * v[d * 128 + t];
+        acc[d] += s;
     }
 }
