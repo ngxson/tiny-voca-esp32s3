@@ -66,6 +66,11 @@ data 16-byte aligned. dtype 0 f32, 1 i8, 2 i32. Per int8 linear `<base>`: `.wq` 
 `.pre` i32 `[chunks][N]` (project only). Activation scales are `<point>.max` f32 scalars. The same
 container format is used for the test vectors, the phonemizer data and dumps.
 
+The engine takes the token and voice counts from the shapes of `tokens.weight` and `voices.weight`,
+and the first vowel id from `meta.first_vowel` (i32 `[1]`, 43 when absent), so a fine-tune with
+another phoneme inventory or more voices (another language) runs on the same firmware. The export
+calibrates over every voice and requires the vowels to be the last ids of the inventory.
+
 ## Engine
 
 `tv_synthesize`: embeddings, encoder stack (4 blocks over tokens), duration predictor, repeat by

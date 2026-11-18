@@ -95,7 +95,7 @@ def main():
         # mean GELU code per input channel of every `project`, for the centring preload
         sums, counts = {}, {}
         for p in calibration:
-            for voice in (0, 1):
+            for voice in range(len(model.config.speakers)):
                 golden.synthesize(p.ids, p.stress, voice, dump=True)
                 for name, codes in golden.dump.items():
                     if name.endswith(".gelu") and codes.dtype == torch.int8:
@@ -119,6 +119,11 @@ def main():
             tensors[base + ".pre"] = project_preload(q, sums[base] / counts[base], PROJECT_CHUNKS)
     for name, value in golden.scales.items():
         tensors[name + ".max"] = np.array([value], np.float32)
+    # The engine tells vowels by `id >= first_vowel`, so the vowels must close the inventory.
+    vowels = model.vowel_tokens.nonzero().reshape(-1).tolist()
+    if vowels != list(range(vowels[0], model.config.vocab_size)):
+        raise ValueError(f"vowel ids {vowels} are not the last ids of the inventory")
+    tensors["meta.first_vowel"] = np.array([vowels[0]], np.int32)
     for name, value in sd.items():
         base = name.rsplit(".", 1)[0]
         if base in golden.w and name.endswith((".weight", ".bias")):

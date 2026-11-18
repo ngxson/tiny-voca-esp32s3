@@ -215,7 +215,7 @@ def main():
             model = base if spec is None else quantized_model(base, *spec)
         seed = 1 if name == "fp32-seed1" else 0
         clips, scores, same, total = [], [], 0, 0
-        for voice in (0, 1):
+        for voice in range(len(base.config.speakers)):
             for i, p in enumerate(tokens):
                 free = run(model, p, voice, seed=seed)
                 clips += [free["audio"], gap]

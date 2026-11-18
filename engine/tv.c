@@ -160,10 +160,20 @@ int tv_model_init(tv_model *m, const void *data, size_t size) {
         return -1;
     }
     loader L = {m, 0};
-    m->tokens = get(&L, "tokens.weight", TV_F32, 76 * TV_C);
+    const tv_entry *tok = tv_file_find(&m->file, "tokens.weight"), *voi = tv_file_find(&m->file, "voices.weight");
+    m->n_vocab = tok ? (int)(tok->nbytes / (4 * TV_C)) : 0;
+    m->n_voices = voi ? (int)(voi->nbytes / (4 * TV_C)) : 0;
+    const int32_t *fv = tv_file_get(&m->file, "meta.first_vowel", TV_I32, 1);
+    m->first_vowel = fv ? *fv : FIRST_VOWEL;
+    if (m->n_vocab <= FIRST_PHONE || m->n_voices < 1 || m->first_vowel < FIRST_PHONE || m->first_vowel >= m->n_vocab) {
+        snprintf(m->error, sizeof m->error, "bad vocabulary (%d tokens, %d voices, first vowel %d)",
+                 m->n_vocab, m->n_voices, m->first_vowel);
+        return -1;
+    }
+    m->tokens = get(&L, "tokens.weight", TV_F32, m->n_vocab * TV_C);
     m->stress = get(&L, "stress.weight", TV_F32, 3 * TV_C);
-    m->voices = get(&L, "voices.weight", TV_F32, 2 * TV_C);
-    m->frame_voices = get(&L, "frame_voices.weight", TV_F32, 2 * TV_C);
+    m->voices = get(&L, "voices.weight", TV_F32, m->n_voices * TV_C);
+    m->frame_voices = get(&L, "frame_voices.weight", TV_F32, m->n_voices * TV_C);
     load_stack(&L, &m->encoder, m->block_storage, "encoder", 4);
     load_stack(&L, &m->prosody, m->block_storage + 4, "prosody_stack", 2);
     load_stack(&L, &m->acoustic, m->block_storage + 6, "acoustic_stack", 5);
@@ -641,7 +651,9 @@ int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, 
                   const tv_options *opt, tv_result *res) {
     ctx c = {opt, 0};
     memset(res, 0, sizeof *res);
-    if (N < 1 || voice < 0 || voice > 1) return -1;
+    if (N < 1 || voice < 0 || voice >= m->n_voices) return -1;
+    for (int t = 0; t < N; t++)
+        if (ids[t] < 0 || ids[t] >= m->n_vocab || stress[t] < 0 || stress[t] > 2) return -1;
     // ---- text encoder
     float *x = xmalloc((size_t)N * TV_C * sizeof(float)), *hidden = xmalloc((size_t)N * TV_C * sizeof(float));
     for (int t = 0; t < N; t++)
@@ -670,7 +682,7 @@ int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, 
         for (int o = 0; o < dur[t]; o++, f++) {
             feat[0] = ((float)o + 0.5f) / (float)owned;
             feat[1] = 1.0f - feat[0];
-            vowel[f] = ids[t] >= FIRST_VOWEL;
+            vowel[f] = ids[t] >= m->first_vowel;
             for (int i = 0; i < TV_C; i++) {
                 const float *w = m->frame_pos_w + i * 3;
                 frames[(size_t)f * TV_C + i] = hidden[t * TV_C + i] +

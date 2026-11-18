@@ -210,10 +210,10 @@ class Golden:
         return {"audio": wave[0, :n * self.c.hop], "durations": durations, "prosody": prosody}
 
     def calibrate(self, utterances):
-        """utterances: [(ids, stress)]; both voices. Returns the scales dict (max|x|)."""
+        """utterances: [(ids, stress)]; every voice. Returns the scales dict (max|x|)."""
         self.scales, self.observed = None, {}
         for ids, stress in utterances:
-            for voice in (0, 1):
+            for voice in range(len(self.c.speakers)):
                 self.synthesize(ids, stress, voice)
         # float32 values: exactly what the export stores, so C and Python round alike
         self.scales = {k: float(torch.tensor(v, dtype=torch.float32)) for k, v in self.observed.items()}
