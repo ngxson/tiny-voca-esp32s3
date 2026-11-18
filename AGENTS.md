@@ -77,20 +77,44 @@ vocoder heads (int8), source-filter vocoder (float).
   (2) attention for the tile, output projection added into the residual;
   (3) LayerNorm2 with a 3-row carry (pre-update values for the depthwise conv), expand, GELU, project
   added into the residual. Only the residual and the int8 Q/K/V span the whole utterance.
+  The row-wise float work (LayerNorms, rotary with the Q/K/V codes, depthwise conv) is split over
+  the two cores (`tile_parallel`); every row is computed as on one core.
 - **Attention** is two passes over key chunks of 128 with no score matrix: pass 1 finds each query's
   max dot product, pass 2 recomputes the dots, maps them to weights and accumulates weights times
   values. Integer sums, so it equals the one-pass result exactly. Heads are split over the two cores.
+  Pass 1 keeps the max of every chunk, so pass 2 skips chunks whose weights are all 0. Per chunk,
+  pass 2 computes the weights of all rows first and then all weights times values, so one chunk
+  (keys, then values) streams through the cache at a time. The output goes straight to int8 codes.
 - **Streaming vocoder.** Harmonic (FFT 512, hop 128) and noise (FFT 256, hop 64) branches are
   streaming STFT filters: frame responses computed when needed, samples final after their last frame,
   arithmetic order equal to `torch.stft`/`istft`. The two branches run on the two cores in blocks of
-  8192 samples. Output goes to `tv_options.on_audio` (the console streams it to the speaker).
+  8192 samples (the first two shorter, so sound starts sooner). Output goes to `tv_options.on_audio`
+  (the console streams it to the speaker). The windows are rings, nothing is shifted per frame.
+  The pulse phase is an integer in units of 2^-52 (`phase_step`): the S3 has no double hardware,
+  and the double it replaces never rounds for these steps, so the values are the same.
+- **Streaming acoustic stack.** Encoder, durations and the prosody stack see the whole utterance
+  (that is where the intonation is planned). The acoustic stack is then pulled by the vocoder
+  (`need` callback of `tv_vocoder_stream`): a frame attends to the 512 frames before it and the 32
+  after it (`acoustic_past`, `acoustic_lookahead`), so each block runs just ahead of the audio
+  (`block_advance` keeps its progress) and keys, values, queries and vocoder inputs live in rings.
+  Rows do not depend on how they are grouped, so the result equals one pass with the same mask.
+  Against full attention (7 sentences, mel L1; another noise seed gives 1.13 dB): 1.14 dB, pitch
+  identical, no difference in a blind listening test. Masking the prosody stack instead moved the
+  pitch by ~140 cents. Debug runs compute the same mask in one pass, and the streamed result is
+  bit-identical to it: `tvhost ... --twice --lookahead 32 --past 512` checks that (and look-ahead 0,
+  full attention, is the reference that firmware `TEST` compares with).
 - **Epilogues** are fused into the matmul (`tv_linear_run`): store float, add into the residual, or
   quantize to int8 through a table (expand writes final GELU codes). LayerNorm1 and the depthwise
   conv write int8 directly. When a debug hook is set, expand runs unfused so the pre-activation codes
   can be checked; both paths must give bit-identical audio (`tvhost --twice`, firmware `TEST`).
-- **Memory:** about 2.7 KB per frame at the peak plus ~0.7 MB of fixed buffers. `tv_options.max_frames`
-  makes `tv_synthesize` return `TV_TOO_LONG` before allocating; the console computes the budget from
-  free PSRAM (~1,400 frames, 15 s) and falls back to splitting at commas.
+- **Memory:** about 1.3 KB per frame plus ~2.7 MB fixed (mostly the key/value rings of the 5
+  acoustic blocks, ~1.7 MB); the prosody stack over the whole utterance sets the per-frame peak.
+  Full attention (look-ahead 0) needs about 2.9 KB per frame. The small buffers the
+  kernels read most (matmul input tiles, attention weights, ~70 KB) go to internal RAM when 64 KB
+  stays free (`tv_alloc_fast`): PSRAM and flash share the external bus, so this also speeds up the
+  weights streaming from flash. `tv_options.max_frames` makes `tv_synthesize` return `TV_TOO_LONG`
+  before allocating; the console computes the budget from free PSRAM (~1,770 frames, 19 s) and
+  falls back to splitting at commas.
 
 ## S3 kernels (`firmware/main/kernels_s3.S`)
 
@@ -98,8 +122,9 @@ vocoder heads (int8), source-filter vocoder (float).
   against 16 weights). Weights are loaded 3 instructions ahead (q1..q4 rotate), inputs one chunk ahead.
   The accumulator starts from a 64-byte raw state (zero, bias or centring preload) and is stored raw;
   `unpack_qacc` reads the 2 x 8 lanes of 20 bits. 12.6 MAC/cycle kernel-only in the benchmark.
-- `dot_rows_s8_accx` / `dot48_rows_accx`: exact dot products in the 40-bit ACCX, for attention
-  (Q.K over 48 dims and weights.V could overflow 20 bits).
+- `attn_max48`, `attn_weights48`, `attn_pv64`: attention in the 40-bit ACCX (Q.K over 48 dims and
+  weights.V could overflow 20 bits). The query (or 64 weights) stays in registers while rows stream.
+  `attn_weights48` does dot, gap, `minu` clamp and table lookup in one loop (the table ends with a 0).
 - QACC lanes **saturate** at +-2^19 (no wrap). `ee.srcmb.s8.qacc` shifts and writes back into QACC;
   `ee.srcmb.s16.qacc` is garbage in 8-bit mode. The host backend emulates saturation and counts it;
   the board flags a lane sitting exactly on the rail. Any saturation is a bug.
@@ -133,7 +158,7 @@ To add a board: copy `boards/waveshare_s3_audio`, change the pins and the amplif
 `board.c`, set flash and PSRAM in its `sdkconfig.defaults`, and size `partitions.csv` to the flash.
 Shared hardware code goes to `drivers/`. Current needs: about 11.4 MB of flash (app 1.2 MB, model
 4.85 MB, phonemizer data 5.4 MB, test vector 0.3 MB) and 8 MB of PSRAM (phonemizer ~2.9 MB,
-synthesis ~0.7 MB + 2.7 KB per frame; octal PSRAM, quad is slower).
+synthesis ~2.7 MB + 1.3 KB per frame; octal PSRAM, quad is slower).
 
 ### Waveshare ESP32-S3-AUDIO-Board (`waveshare_s3_audio`)
 
@@ -205,10 +230,14 @@ python tools/compare_dump.py out/test0.bin out/dev.bin   # vs golden: ~0.9-1.0 d
 
 ## Performance (board)
 
-A 3.3 s test sentence: 4.4 s (RTF ~0.75). A 9.25 s sentence: first sound after 10.9 s, then it plays
-without gaps (the vocoder alone is faster than real time). Main costs: int8 matmuls (~700 MMAC/s:
-weights in flash cost about 2x, see the `mmbench` console command), attention pass 2, vocoder.
-The obvious next step is moving the weights to PSRAM, at the cost of the sentence-length budget.
+A 3.3 s test sentence: 3.1 s (`TEST`, production path, full attention). Playback starts 0.5 s into
+"Hi." and (after a 0.4 s pre-roll, which only longer utterances need) 1.5 s into a 2.9 s sentence, 2.3 s into 5.6 s, 2.8 s into 7.5 s, 3.9 s into 10.2 s
+and 9.4 s into 21 s, and runs without gaps; the console reports any (`gaps` in its summary). The
+prosody stack over the whole utterance is what is left before the first sound, and it grows with
+the square of the length. Main costs: int8 matmuls (~25%), attention (~20%). Moving the weights to PSRAM would gain at most ~7% here
+(`mmbench`: 698 vs 879 MMAC/s at 64 rows) and does not fit next to the phonemizer. Flash and PSRAM
+at 120 MHz corrupt data intermittently (`TEST` audio differs) and running code from PSRAM gains
+nothing.
 
 ## Working rules
 

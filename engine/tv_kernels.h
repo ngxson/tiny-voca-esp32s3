@@ -10,6 +10,8 @@ extern "C" {
 
 // 16-byte aligned, with at least 64 bytes of readable slack after n (kernels over-read).
 void *tv_alloc(size_t n);
+// The same, in faster memory when there is room (small buffers the kernels read a lot).
+void *tv_alloc_fast(size_t n);
 void tv_free(void *p);
 
 void tv_kernels_init(void);
@@ -50,8 +52,13 @@ static inline void tv_epilogue_put(const tv_epilogue *e, void *out, size_t at, f
 // Runs fn(a) and fn(b), on the two cores where there are two. fn must not call tv_linear_run.
 void tv_parallel2(void (*fn)(void *), void *a, void *b);
 
-// Exact int32 dot products: out[n] = sum_k x[k] * W[n*K + k]. K % 16 == 0.
-void tv_dot_rows_i8(const int8_t *x, const int8_t *W, int N, int K, int32_t *out);
+// Attention over one head (dimension 48), dots d[t] = q . K[t*48 : t*48+48] for t < n:
+// max(m, d[0..n)).
+int32_t tv_attn_max48(const int8_t *q, const int8_t *K, int n, int32_t m);
+// w[t] = lut[min(m - d[t], lim)] for t < n (lut[lim] must be 0); returns the sum of the w[t].
+int32_t tv_attn_weights48(const int8_t *q, const int8_t *K, int n, int32_t m, const uint8_t *lut, uint32_t lim, int8_t *w);
+// acc[d] += sum_t w[t] * v[d*128 + t] for d < 48, t < 128 (one key chunk of transposed values).
+void tv_attn_pv48(const int8_t *w, const int8_t *v, int32_t *acc);
 
 #ifdef __cplusplus
 }

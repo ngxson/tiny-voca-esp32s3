@@ -124,8 +124,11 @@ static void write_wav(const char *path, const float *x, int n) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: %s tvoca.bin test.bin out.wav [--force-durations] [--quiet]\n", argv[0]); return 2; }
-    int force = 0, quiet = 0;
+    if (argc < 4) {
+        fprintf(stderr, "usage: %s tvoca.bin test.bin out.wav [--force-durations] [--quiet] [--lookahead N --past N]\n", argv[0]);
+        return 2;
+    }
+    int force = 0, quiet = 0, lookahead = 0, past = 0;
     const char *dump = NULL;
     int vocoder_only = 0, twice = 0;
     for (int i = 4; i < argc; i++) {
@@ -134,6 +137,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dump = argv[++i];
         else if (!strcmp(argv[i], "--vocoder-only")) vocoder_only = 1;
         else if (!strcmp(argv[i], "--twice")) twice = 1;
+        else if (!strcmp(argv[i], "--lookahead") && i + 1 < argc) lookahead = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--past") && i + 1 < argc) past = atoi(argv[++i]);
     }
     size_t msize, tsize;
     void *mdata = read_file(argv[1], &msize), *tdata = read_file(argv[2], &tsize);
@@ -149,7 +154,8 @@ int main(int argc, char **argv) {
     const int32_t *golden_dur = tv_file_get(&c.test, "durations", TV_I32, n);
     const tv_entry *noise_e = tv_file_find(&c.test, "noise");
     tv_options opt = {.speed = 1.0f, .noise = (const float *)(c.test.base + noise_e->offset),
-                      .force_durations = force ? golden_dur : NULL, .debug = check, .debug_user = &c};
+                      .force_durations = force ? golden_dur : NULL, .debug = check, .debug_user = &c,
+                      .acoustic_lookahead = lookahead, .acoustic_past = past};
     if (vocoder_only) {     // golden acoustic + prosody in, compare the waveform sample by sample
         const tv_entry *ae = tv_file_find(&c.test, "acoustic");
         int T = ae->shape[0];

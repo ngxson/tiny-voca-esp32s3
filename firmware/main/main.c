@@ -151,13 +151,20 @@ static void run_syn(char *line) {
     printf("DONE\n");
 }
 
-// Frames that fit in the free PSRAM: ~2.7 KB per frame at the peak (tiled stacks, streaming
-// vocoder) plus ~0.7 MB of fixed tile and vocoder buffers; the largest single buffer is
-// T x 768 bytes. The model itself handles at most 3000 frames.
+// The acoustic stack is streamed into the vocoder: a frame sees 32 frames ahead and 512 back, so
+// sound starts early and its memory stays fixed. "look 0" switches to full attention (the
+// reference numerics; sound starts only once the whole acoustic stack is done).
+static int acoustic_lookahead = 32;
+#define ACOUSTIC_PAST 512
+
+// Frames that fit in the free PSRAM. Streaming with a past window: ~2.7 MB fixed (key and value
+// rings, the token states) plus ~1.3 KB per frame, measured; full attention: ~2.9 KB per frame.
+// The largest single buffer is T x 768 bytes. The model itself handles at most 3000 frames.
 static int frame_budget(void) {
-    long total = (long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM) - 1200 * 1024;
+    long fixed = acoustic_lookahead > 0 ? 3000 * 1024 : 1200 * 1024, bytes_per_frame = acoustic_lookahead > 0 ? 1300 : 2900;
+    long total = (long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM) - fixed;
     long largest = (long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) - 64 * 1024;
-    long frames = total / 2900;
+    long frames = total / bytes_per_frame;
     if (largest / 800 < frames) frames = largest / 800;
     if (frames > 3000) frames = 3000;
     return frames > 0 ? (int)frames : 0;
@@ -168,13 +175,21 @@ typedef struct {
     int16_t *chunk;
     int fill;
     float peak;
-    int64_t t_first;            // when the first samples arrived
+    int64_t t_first;            // when playback started
+    int preroll;                // samples to collect before playback starts
+    int64_t play_end;           // when the queued audio runs out
+    int gaps;                   // chunks that came after it ran out (audible gaps)
+    int64_t gap_us;
 } stream_state;
 
 #define STREAM_CHUNK 4800
 
 static void stream_flush(stream_state *st) {
     if (!st->fill) return;
+    int64_t now = esp_timer_get_time();
+    if (!st->t_first) st->t_first = now;
+    if (st->play_end && now > st->play_end) { st->gaps++; st->gap_us += now - st->play_end; }
+    st->play_end = (now > st->play_end ? now : st->play_end) + (int64_t)st->fill * 1000000 / TV_SAMPLE_RATE;
     board_play(st->chunk, st->fill);                 // the player frees it
     st->chunk = NULL;
     st->fill = 0;
@@ -182,14 +197,14 @@ static void stream_flush(stream_state *st) {
 
 static void on_audio(void *user, const float *x, int n) {
     stream_state *st = user;
-    if (!st->t_first) st->t_first = esp_timer_get_time();
     for (int i = 0; i < n; i++) {
-        if (!st->chunk) st->chunk = tv_alloc(STREAM_CHUNK * 2);
+        int size = st->t_first ? STREAM_CHUNK : st->preroll;
+        if (!st->chunk) st->chunk = tv_alloc((size_t)size * 2);
         float v = x[i];
         if (fabsf(v) > st->peak) st->peak = fabsf(v);
         v = v > 0.99f ? 0.99f : v < -0.99f ? -0.99f : v;
         st->chunk[st->fill++] = (int16_t)lrintf(v * 32767.0f);
-        if (st->fill == STREAM_CHUNK) stream_flush(st);
+        if (st->fill == size) stream_flush(st);
     }
 }
 
@@ -233,18 +248,24 @@ static int say_piece(char *text, int voice, unsigned seed, int depth) {
     static int32_t ids[512], stress[512];
     int n = tvp_phonemize(text, ids, stress, 512);
     if (n == -2 || n > 0) {
-        stream_state st = {0};
+        // Streaming a longer utterance, the acoustic stack still has work to do while the first audio
+        // plays: collect 0.4 s before playback starts so the next chunk is ready in time. Up to
+        // ~250 frames (~40 phonemes) that was never needed.
+        stream_state st = {.preroll = acoustic_lookahead > 0 && n > 30 ? 2 * STREAM_CHUNK : STREAM_CHUNK};
         board_show_text(text);
         tv_profile_reset();
-        tv_options opt = {.speed = 1.0f, .seed = seed, .max_frames = frame_budget(), .on_audio = on_audio, .audio_user = &st};
+        tv_options opt = {.speed = 1.0f, .seed = seed, .max_frames = frame_budget(), .on_audio = on_audio, .audio_user = &st,
+                          .acoustic_lookahead = acoustic_lookahead, .acoustic_past = ACOUSTIC_PAST};
         tv_result r;
         int64_t t0 = esp_timer_get_time();
         int rc = n > 0 ? tv_synthesize(&model, ids, stress, n, voice, &opt, &r) : TV_TOO_LONG;
         if (rc == 0) {
             stream_flush(&st);
             double ms = (esp_timer_get_time() - t0) / 1000.0, audio_ms = 1000.0 * r.n_samples / TV_SAMPLE_RATE;
-            printf("  [%d phonemes, %d frames, %.2f s audio, first sound after %.2f s, done after %.2f s, peak %.2f] %s\n",
-                   n, r.n_frames, audio_ms / 1000, (st.t_first - t0) / 1e6, ms / 1000, st.peak, text);
+            char gaps[48] = "";
+            if (st.gaps) snprintf(gaps, sizeof gaps, ", %d gaps (%.2f s)", st.gaps, st.gap_us / 1e6);
+            printf("  [%d phonemes, %d frames, %.2f s audio, first sound after %.2f s, done after %.2f s, peak %.2f%s] %s\n",
+                   n, r.n_frames, audio_ms / 1000, (st.t_first - t0) / 1e6, ms / 1000, st.peak, gaps, text);
             tv_free(r.durations);
             if (profiling) tv_profile_report();
             return 0;
@@ -327,6 +348,11 @@ static void run(void *arg) {
         else if (!strcmp(line, "mmbench")) mmbench();
         else if (!strcmp(line, "prof")) { profiling = !profiling; printf("profiling %s\n", profiling ? "on" : "off"); }
         else if (!strncmp(line, "voice ", 6)) { voice_id = !strcmp(line + 6, "F2") ? 0 : 1; printf("voice %s\n", voice_id ? "M2" : "F2"); }
+        else if (!strncmp(line, "look ", 5)) {     // the memory budget assumes a small look-ahead
+            int v = atoi(line + 5);
+            acoustic_lookahead = v < 0 ? 0 : v > 64 ? 64 : v;
+            printf("acoustic look-ahead %d\n", acoustic_lookahead);
+        }
         else if (!strncmp(line, "vol ", 4)) {
             int v = atoi(line + 4);
             printf(board_set_volume(v) ? "volume: codec not available\n" : "volume %d%%\n", v < 0 ? 0 : v > 100 ? 100 : v);

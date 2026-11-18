@@ -38,9 +38,10 @@ tts> Hello! This is tiny voca, speaking from the little board on your desk.
 | `vol 50` | Speaker volume, 0 to 100 |
 | `beep` | Test the speaker |
 | `prof` | Print where the time goes after each sentence |
+| `look 0` / `look 32` | Full attention (speech starts later) / streaming, the default |
 
 A short sentence starts playing after about a second, a long one after a few seconds. One sentence
-can be up to about 15 seconds long; longer ones are split at commas.
+can be up to about 19 seconds long; longer ones are split at commas.
 
 ## Building the firmware
 

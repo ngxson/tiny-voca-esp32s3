@@ -95,6 +95,13 @@ typedef struct {
     uint32_t seed;
     const int32_t *force_durations; // NULL: predicted
     int max_frames;                 // > 0: return TV_TOO_LONG instead of synthesizing more frames
+    // The acoustic stack is streamed into the vocoder. With a look-ahead > 0 a frame sees only that
+    // many later frames, so sound starts before the whole stack is done; with past > 0 (only used with
+    // a look-ahead) also only that many earlier ones, so its memory does not grow with the utterance.
+    // A look-ahead without a past keeps whole-utterance keys and values for every block. 0: full
+    // attention. Debug runs compute the same in one pass, with every tensor whole.
+    int acoustic_lookahead;
+    int acoustic_past;
     tv_audio_fn on_audio;           // set: audio is streamed here and tv_result.audio stays NULL
     void *audio_user;
     tv_debug_fn debug;
@@ -126,8 +133,12 @@ void tv_profile_report(void);       // printf, one line per category
 #define TV_PROF(id, stmt) do { uint64_t tv_t0_ = tv_time_us(); stmt; tv_prof[id] += tv_time_us() - tv_t0_; } while (0)
 
 // ---------------------------------------------------------------- internals shared with the DSP file
+// Frame f of harmonic, noise_params and f0 is at f % ring (ring 0: T, whole arrays). need (may be
+// NULL) is called before each block with the number of leading frames that must be final by then,
+// so the caller can compute them as they are asked for.
+typedef void (*tv_need_fn)(void *user, int frames);
 void tv_vocoder_stream(const float *harmonic, const float *noise_params, const float *f0, const float *noise,
-                       uint64_t seed, int T, tv_audio_fn sink, void *user);
+                       uint64_t seed, int T, int ring, tv_audio_fn sink, void *user, tv_need_fn need, void *need_user);
 void tv_vocoder(const float *harmonic /*[T][98]*/, const float *noise_params /*[T][36]*/, const float *f0 /*[T]*/,
                 const float *noise /*[T*hop]*/, int T, float *audio /*[T*hop]*/);
 
