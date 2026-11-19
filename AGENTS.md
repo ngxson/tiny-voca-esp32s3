@@ -150,6 +150,16 @@ Flash: app 2 MB at 0x10000, `model` 6 MB at 0x210000, `testvec` 1 MB at 0x810000
 at 0x910000 (`boards/waveshare_s3_audio/partitions.csv`). The model is memory-mapped from flash;
 PSRAM holds the phonemizer (~2.9 MB) and activations.
 
+### Waveshare ESP32-S3-Touch-AMOLED-2.16 (`waveshare_s3_amoled_216`)
+
+ESP32-S3R8 with 16 MB quad flash and 8 MB octal PSRAM, so the flash layout is the same as
+`waveshare_s3_audio`. I2C SDA 15, SCL 14; I2S MCLK 42, BCLK 9, WS 45, DOUT 8 (DIN 10 is the ES7210
+mic ADC, unused). ES8311 at 0x18; the speaker amplifier is enabled by GPIO 46 (high). The AXP2101
+power-on defaults already feed the codec, so the PMU is not touched. Pins are from Waveshare's BSP
+(`waveshare/esp32_s3_touch_amoled_2_16`) and the schematic. The 480 x 480 CO5300 QSPI AMOLED
+(CS 12, CLK 38, D0-D3 4-7, reset 39) is not driven yet: `board_show_text` is a no-op, and after a
+soft reset the panel keeps showing whatever the previous firmware left on it.
+
 ### Waveshare ESP32-S3-ePaper-1.54 (not supported yet)
 
 Checked 2026-11-17 against [the Waveshare docs](https://docs.waveshare.com/ESP32-S3-ePaper-1.54) and

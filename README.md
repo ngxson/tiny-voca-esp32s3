@@ -11,6 +11,7 @@ No cloud, no computer once it is flashed.
 | Board | `BOARD` | Status |
 |---|---|---|
 | [Waveshare ESP32-S3-AUDIO-Board](https://www.waveshare.com/wiki/ESP32-S3-AUDIO-Board) | `waveshare_s3_audio` | Works |
+| [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-s3-touch-amoled-2.16.htm) | `waveshare_s3_amoled_216` | Works |
 
 ## Quick start
 
