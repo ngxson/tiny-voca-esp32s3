@@ -1,7 +1,7 @@
 """Read the firmware's console: print the log, decode TVDUMP base64 blocks into a TVQ1 file.
 Hard deadline; stops on TVDUMP_DONE, "tv: finished", a panic or a reboot.
 
-    python tools/serial_dump.py /dev/cu.usbmodem1201 180 out/dev_test0.bin
+    python tools/serial_dump.py /dev/ttyACM0 180 out/dev_test0.bin TEST      # macOS: /dev/cu.usbmodem*
 """
 import base64, signal, struct, sys, time
 import serial
@@ -23,7 +23,7 @@ while s is None:
     try:
         s = serial.Serial()
         s.port, s.baudrate, s.timeout = port, 115200, 0.2
-        s.dtr = s.rts = False
+        s.rts = False  # only RTS: DTR low with RTS high resets the S3
         s.open()
     except Exception:
         s = None

@@ -277,13 +277,17 @@ static void say(char *line) {
 }
 
 // Line input with echo and backspace (works in idf.py monitor and from scripts).
+// An empty line returns 0: the tools send one to wait for READY.
 static int read_line(char *buf, int size) {
+    static int prev;
     int n = 0;
     for (;;) {
         int c = fgetc(stdin);
         if (c == EOF) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+        int last = prev;
+        prev = c;
+        if (c == '\n' && last == '\r') continue;    // second half of a CRLF
         if (c == '\r' || c == '\n') {
-            if (n == 0) continue;           // second half of CRLF, or an empty line
             putchar('\n'); fflush(stdout);
             buf[n] = 0;
             return n;
@@ -320,7 +324,7 @@ static void run(void *arg) {
     for (;;) {
         printf("READY\ntts> ");
         fflush(stdout);
-        read_line(line, sizeof line);
+        if (!read_line(line, sizeof line)) continue;
         if (!strncmp(line, "SYN ", 4)) run_syn(line);
         else if (!strcmp(line, "TEST")) run_test();
         else if (!strcmp(line, "beep")) board_beep(880, 300);

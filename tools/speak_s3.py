@@ -8,7 +8,7 @@ binary a plain lexicon lookup is used and words missing from the lexicon are ski
 Keep-up model: sentences are synthesized one after another and each plays as soon as it is
 ready and the previous one has finished; any wait between sentences is a gap.
 """
-import argparse, base64, os, signal, subprocess, sys, time, wave
+import argparse, base64, glob, os, signal, subprocess, sys, time, wave
 from pathlib import Path
 import serial
 
@@ -20,6 +20,12 @@ WEIGHTS = Path(os.environ.get("TINY_VOCA_WEIGHTS",
 sys.path.insert(0, str(TINY_VOCA / "src"))
 from tiny_voca.infer import sentences, finished                          # noqa: E402
 from tiny_voca.text import chunks, normalize_text, tokenize, parse_espeak  # noqa: E402
+
+
+def default_port():
+    """The first /dev/ttyACM* (Linux) or /dev/cu.usbmodem* (macOS): the S3's USB Serial/JTAG."""
+    found = sorted(glob.glob("/dev/ttyACM*")) + sorted(glob.glob("/dev/cu.usbmodem*"))
+    return found[0] if found else "/dev/ttyACM0"
 
 
 def load_lexicon(path):
@@ -65,7 +71,7 @@ class Board:
     def __init__(self, port):
         self.s = serial.Serial()
         self.s.port, self.s.baudrate, self.s.timeout = port, 115200, 0.2
-        self.s.dtr = self.s.rts = False          # do not reset the chip on open
+        self.s.rts = False  # only RTS: DTR low with RTS high resets the S3
         self.s.open()
         self.buf = b""
 
@@ -115,7 +121,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--text", required=True)
     parser.add_argument("--voice", choices=("F2", "M2"), default="M2")
-    parser.add_argument("--port", default="/dev/cu.usbmodem1201")
+    parser.add_argument("--port", default=default_port())
     parser.add_argument("--out", default=str(REPO / "out/s3.wav"))
     parser.add_argument("--phonemizer", default=str(WEIGHTS / "phonemizer"))
     parser.add_argument("--dizione", default=str(REPO / "out/bin/dizione_cli"))

@@ -192,7 +192,7 @@ Order of trust: fp32 PyTorch, golden model (`tvq.py`), host engine, board.
 python tools/export.py                                  # also writes the golden dump test0.bin
 make -C engine/host
 engine/host/tvhost out/tvoca.bin out/test0.bin out/c.wav --quiet --twice --dump out/c.bin
-python tools/serial_dump.py /dev/cu.usbmodem1201 180 out/dev.bin TEST
+python tools/serial_dump.py /dev/ttyACM0 180 out/dev.bin TEST      # macOS: /dev/cu.usbmodem*
 python tools/compare_dump.py out/c.bin out/dev.bin       # board vs host: must be 0.00 dB, 0 cents
 python tools/compare_dump.py out/test0.bin out/dev.bin   # vs golden: ~0.9-1.0 dB, ~2 cents
 ```
@@ -215,6 +215,6 @@ The obvious next step is moving the weights to PSRAM, at the cost of the sentenc
 - Every build, flash and serial read runs under a hard timeout (macOS has no `timeout`:
   `perl -e 'alarm shift; exec @ARGV' SECS cmd`); serial readers stop on panic and reboot too.
 - ESP-IDF's Python has no numpy: run `compare_dump.py` and the export tools with the project's Python.
-- If flashing says the port is busy, check `lsof /dev/cu.usbmodem*` (a monitor may hold it).
+- If flashing says the port is busy, check `lsof /dev/ttyACM* /dev/cu.usbmodem*` (a monitor may hold it).
 - The firmware build uses `-Werror`; `tv.h` and `tv_kernels.h` have `extern "C"` guards for the C++ glue.
 - Commit messages: imperative subject, body explaining what and why; no co-author lines.

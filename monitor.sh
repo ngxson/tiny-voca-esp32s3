@@ -2,7 +2,7 @@
 # Print the ESP32 serial log and send stdin to the board (Ctrl+C to quit).
 # Usage: ./monitor.sh [-r] [port]
 #   -r    reset the board first, to get the boot log
-#   port  defaults to the first /dev/cu.usbmodem*
+#   port  defaults to the first /dev/ttyACM* (Linux) or /dev/cu.usbmodem* (macOS)
 # Typed keys go to the board as they are pressed (the board echoes them and handles
 # backspace); piped input is forwarded too: echo "Hello there." | ./monitor.sh
 set -euo pipefail
@@ -14,9 +14,9 @@ if [ "${1:-}" = "-r" ]; then
     shift
 fi
 
-PORT="${1:-$(ls /dev/cu.usbmodem* 2>/dev/null | head -n1 || true)}"
+PORT="${1:-$(ls /dev/ttyACM* /dev/cu.usbmodem* 2>/dev/null | head -n1 || true)}"
 if [ -z "$PORT" ]; then
-    echo "No /dev/cu.usbmodem* found - is the board plugged in?" >&2
+    echo "No /dev/ttyACM* or /dev/cu.usbmodem* found - is the board plugged in?" >&2
     exit 1
 fi
 

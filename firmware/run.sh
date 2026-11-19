@@ -3,7 +3,7 @@
 #   BOARD=waveshare_s3_audio ./run.sh [--data] [capture seconds]
 set -o pipefail
 to() { local s=$1; shift; perl -e 'alarm shift; exec @ARGV' "$s" "$@"; }
-PORT=/dev/cu.usbmodem1201
+PORT=${PORT:-$(ls /dev/ttyACM* /dev/cu.usbmodem* 2>/dev/null | head -n1)}     # Linux or macOS; or set PORT
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=$HERE/../out
 DATA=0; [ "$1" = "--data" ] && { DATA=1; shift; }
