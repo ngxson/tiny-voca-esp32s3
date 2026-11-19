@@ -7,6 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef M_SQRT1_2                   // not in strict C (the host build uses -std=c11)
+#define M_SQRT1_2 0.70710678118654752440
+#endif
+
 #define GELU_MIN (-0.16997124f)
 #define VOCAB_UNK 4
 #define FIRST_PHONE 17
@@ -19,12 +23,14 @@ int tv_file_open(tv_file *f, const void *data, size_t size) {
     uint32_t version, count;
     memcpy(&version, p + 4, 4);
     memcpy(&count, p + 8, 4);
-    if (version != 1 || 16 + (size_t)count * sizeof(tv_entry) > size) return -1;
+    if (version != 1 || count > (size - 16) / sizeof(tv_entry)) return -1;     // no overflow where size_t is 32-bit
     f->base = p;
     f->entries = (const tv_entry *)(p + 16);
     f->count = count;
-    for (uint32_t i = 0; i < count; i++)
-        if ((size_t)f->entries[i].offset + f->entries[i].nbytes > size) return -1;
+    for (uint32_t i = 0; i < count; i++) {     // the kernels need 16-byte aligned tensors
+        const tv_entry *e = &f->entries[i];
+        if (e->offset % 16 || e->offset > size || e->nbytes > size - e->offset) return -1;
+    }
     return 0;
 }
 
@@ -82,7 +88,11 @@ static void load_linear(loader *L, tv_linear *lin, const char *base, int N, int 
         lin->chunks = chunks;
     }
     lin->bias = calloc(N, sizeof(float));
-    if (lin->b) memcpy(lin->bias, lin->b, N * sizeof(float));
+    if (!lin->bias && !L->failed) {
+        snprintf(L->m->error, sizeof L->m->error, "out of memory loading %s", base);
+        L->failed = 1;
+    }
+    if (lin->b && lin->bias) memcpy(lin->bias, lin->b, N * sizeof(float));
     if (!L->failed && tv_linear_prepare(lin)) {
         snprintf(L->m->error, sizeof L->m->error, "kernel preparation failed for %s", base);
         L->failed = 1;
@@ -128,6 +138,11 @@ static void load_block(loader *L, tv_block *b, const char *prefix) {
     double score_scale = (double)b->s_q * b->s_k / sqrt((double)TV_HEAD_DIM);
     b->softmax_n = (int)ceil(log(254.0) / score_scale) + 1;      // 127 * exp(-gap * s) < 0.5 beyond
     b->softmax_lut = malloc(b->softmax_n);
+    if (!b->softmax_lut) {
+        snprintf(L->m->error, sizeof L->m->error, "out of memory loading %s", prefix);
+        L->failed = 1;
+        return;
+    }
     double v = 127.0, step = exp(-score_scale);             // 127 * exp(-g * s) by repeated multiplication
     for (int g = 0; g < b->softmax_n; g++, v *= step) b->softmax_lut[g] = (uint8_t)lrint(v);
     // project reads codes q standing for (q + 128) * s_gelu + GELU_MIN: fold the constant part.
@@ -653,13 +668,22 @@ int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, 
     predict_durations(&c, m, hidden, ids, N, opt->speed > 0 ? opt->speed : 1.0f, dur);
     if (opt->force_durations) memcpy(dur, opt->force_durations, N * sizeof(int32_t));
     dbg(&c, "durations", TV_I32, dur, 1, N);
-    int T = 0;
-    for (int t = 0; t < N; t++) T += dur[t];
-    if (T < 1) { tv_free(x); tv_free(hidden); tv_free(dur); return -2; }
-    if (opt->max_frames > 0 && T > opt->max_frames) {
-        res->n_frames = T;
+    // Negative (forced) durations would make T smaller than the frames written below.
+    long total = 0;
+    int rc = 0;
+    for (int t = 0; t < N && !rc; t++) {
+        if (dur[t] < 0) rc = -1;
+        total += dur[t];
+        if (total > INT32_MAX / TV_HOP) rc = TV_TOO_LONG;
+    }
+    const int T = rc ? 0 : (int)total;
+    if (!rc && T < 1) rc = -2;
+    if (!rc && opt->max_frames > 0 && T > opt->max_frames) rc = TV_TOO_LONG;
+    if (!rc && opt->noise && opt->noise_len < T * TV_HOP) rc = -1;      // it would be read past its end
+    if (rc) {
+        if (rc == TV_TOO_LONG) res->n_frames = total > INT32_MAX ? INT32_MAX : (int)total;
         tv_free(x); tv_free(hidden); tv_free(dur);
-        return TV_TOO_LONG;
+        return rc;
     }
     // ---- repeat token states by duration, add position-in-token and voice
     float *frames = xmalloc((size_t)T * TV_C * sizeof(float)), *ph = xmalloc((size_t)T * TV_C * sizeof(float));

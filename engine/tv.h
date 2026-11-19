@@ -91,7 +91,8 @@ typedef void (*tv_debug_fn)(void *user, const char *name, int dtype, const void 
 
 typedef struct {
     float speed;                    // 1.0
-    const float *noise;             // NULL: engine's own Gaussian noise; else n_frames*TV_HOP values
+    const float *noise;             // NULL: engine's own Gaussian noise; else noise_len values,
+    int noise_len;                  // at least n_frames * TV_HOP (else tv_synthesize returns -1)
     uint32_t seed;
     const int32_t *force_durations; // NULL: predicted
     int max_frames;                 // > 0: return TV_TOO_LONG instead of synthesizing more frames

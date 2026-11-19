@@ -68,9 +68,11 @@ int i2s_player_start(const i2s_player_pins *p) {
         .gpio_cfg = {.mclk = p->mclk, .bclk = p->bclk, .ws = p->ws, .dout = p->dout, .din = I2S_GPIO_UNUSED},
     };
     sc.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
-    if (i2s_channel_init_std_mode(tx, &sc) || i2s_channel_enable(tx)) return -2;
-    queue = xQueueCreate(8, sizeof(chunk));
-    xTaskCreatePinnedToCore(player, "player", 4096, NULL, 10, NULL, 0);
+    if (i2s_channel_init_std_mode(tx, &sc) || i2s_channel_enable(tx)) { i2s_del_channel(tx); tx = NULL; return -2; }
+    QueueHandle_t q = xQueueCreate(8, sizeof(chunk));
+    if (!q) return -3;
+    queue = q;
+    if (xTaskCreatePinnedToCore(player, "player", 4096, NULL, 10, NULL, 0) != pdPASS) { vQueueDelete(q); queue = NULL; return -3; }
     return 0;
 }
 

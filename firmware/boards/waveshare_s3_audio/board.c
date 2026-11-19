@@ -74,9 +74,9 @@ int board_init(int volume) {
                                   .glitch_ignore_cnt = 7, .flags.enable_internal_pullup = true};
     if (i2c_new_master_bus(&bc, &bus)) return -1;
     i2c_device_config_t dc = {.dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = ES8311_ADDR, .scl_speed_hz = 100000};
-    i2c_master_bus_add_device(bus, &dc, &codec);
+    if (i2c_master_bus_add_device(bus, &dc, &codec)) return -1;
     dc.device_address = TCA9555_ADDR;
-    i2c_master_bus_add_device(bus, &dc, &expander);
+    if (i2c_master_bus_add_device(bus, &dc, &expander)) return -1;
     i2s_player_pins pins = {.mclk = 12, .bclk = 13, .ws = 14, .dout = 16, .sample_rate = 24000};
     if (i2s_player_start(&pins)) return -2;                 // MCLK must run before the codec is set up
     leds = ws2812_new(LED_PIN, LED_COUNT);

@@ -1,5 +1,5 @@
 """Read the firmware's console: print the log, decode TVDUMP base64 blocks into a TVQ1 file.
-Hard deadline; stops on TVDUMP_DONE, "tv: finished", a panic or a reboot.
+Hard deadline; stops on TVDUMP_DONE, "tv: finished", a failed TEST, a panic or a reboot.
 
     python tools/serial_dump.py /dev/cu.usbmodem1201 180 out/dev_test0.bin
 """
@@ -32,8 +32,9 @@ if send:
     s.write(b"\n")
 
 dumps, current, chunks, pending = {}, None, [], b""
-stop = (b"TVDUMP_DONE", b"tv: finished", b"Guru Meditation", b"Rebooting...", b"abort() was called")
-done = False
+finished = (b"TVDUMP_DONE", b"tv: finished", b"no test vector", b"synthesize failed")     # the last two: TEST failed
+panic = (b"Guru Meditation", b"Rebooting...", b"abort() was called")
+done = panicked = False
 while not done:
     try:
         data = s.read(65536)
@@ -63,11 +64,11 @@ while not done:
             chunks.append(line)
         else:
             print(line)
-        if any(m in raw for m in stop):
-            done = True
-    if done and any(m in pending for m in stop[2:]):
-        time.sleep(1.0)
-        print(s.read(16384).decode(errors="replace"))
+        panicked = panicked or any(m in raw for m in panic)
+        done = done or panicked or any(m in raw for m in finished)
+if panicked:                    # print the rest of the panic report
+    time.sleep(1.0)
+    print((pending + s.read(16384)).decode(errors="replace"))
 
 if dumps:
     header = 16 + 96 * len(dumps)

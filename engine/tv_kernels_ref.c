@@ -1,5 +1,6 @@
 // Portable reference kernels (host). Emulates the ESP32-S3 QACC exactly, including
 // saturation, so overflow is caught on the host before it can corrupt device output.
+#define _POSIX_C_SOURCE 200112L     // posix_memalign, clock_gettime (the host build uses -std=c11)
 #include "tv_kernels.h"
 #include <stdio.h>
 #include <stdlib.h>

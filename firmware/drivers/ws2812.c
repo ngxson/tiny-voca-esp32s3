@@ -24,6 +24,8 @@ ws2812 *ws2812_new(int gpio, int count) {
                                      .flags.msb_first = 1};
     if (!s->pixels || !s->sending || rmt_new_tx_channel(&tc, &s->channel) || rmt_new_bytes_encoder(&ec, &s->encoder) ||
         rmt_enable(s->channel)) {
+        if (s->encoder) rmt_del_encoder(s->encoder);
+        if (s->channel) rmt_del_channel(s->channel);
         free(s->pixels); free(s->sending); free(s);
         return NULL;
     }

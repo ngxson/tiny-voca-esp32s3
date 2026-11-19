@@ -70,6 +70,7 @@ int tv_linear_prepare(tv_linear *L) {
     int nblocks = (L->N + 15) / 16;
     backend *b = calloc(1, sizeof *b);
     if (!b) return -1;
+    L->backend = b;                             // tv_linear_release frees it, also after a failure here
     b->scale = heap_caps_malloc((size_t)nblocks * 16 * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!b->scale) return -1;
     for (int n = 0; n < nblocks * 16; n++) b->scale[n] = n < L->N ? L->in_scale * L->ws[n] : 0.0f;
@@ -84,7 +85,6 @@ int tv_linear_prepare(tv_linear *L) {
                 pack_qacc(v, b->raw_pre + ((size_t)c * nblocks + nb) * 64);
             }
     }
-    L->backend = b;
     return 0;
 }
 
@@ -174,7 +174,11 @@ void tv_kernels_init(void) {
     if (go_sem) return;
     go_sem = xSemaphoreCreateBinary();
     done_sem = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCore(worker, "tv_worker", 8192, NULL, configMAX_PRIORITIES - 2, NULL, 1);
+    if (!go_sem || !done_sem ||
+        xTaskCreatePinnedToCore(worker, "tv_worker", 8192, NULL, configMAX_PRIORITIES - 2, NULL, 1) != pdPASS) {
+        printf("tv: cannot start the worker on core 1\n");     // tv_parallel2 would wait for it forever
+        abort();
+    }
 }
 
 long tv_linear_run(const tv_linear *L, const int8_t *x, int T, void *out, const tv_epilogue *e) {

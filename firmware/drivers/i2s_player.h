@@ -6,7 +6,7 @@ typedef struct {
     int sample_rate;
 } i2s_player_pins;
 
-int i2s_player_start(const i2s_player_pins *pins);     // 0 on success; MCLK runs afterwards
+int i2s_player_start(const i2s_player_pins *pins);     // 0 on success (MCLK runs afterwards), else < 0
 void i2s_player_play(int16_t *pcm, int n);             // queued; takes ownership (tv_alloc'd)
 int i2s_player_pending(void);                          // chunks waiting
 void i2s_player_beep(int hz, int ms);

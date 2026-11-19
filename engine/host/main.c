@@ -32,6 +32,10 @@ static void check(void *user, const char *name, int dtype, const void *data, int
     checker *c = user;
     const tv_entry *e = tv_file_find(&c->test, name);
     size_t n = (size_t)rows * cols;
+    if (!strcmp(name, "prosody")) {     // kept for --dump, also when the test vector has no golden tensor
+        free(c->prosody); c->prosody = malloc(n * 4); memcpy(c->prosody, data, n * 4); c->prosody_rows = rows;
+    }
+    if (!strcmp(name, "audio")) { free(c->audio); c->audio = malloc(n * 4); memcpy(c->audio, data, n * 4); c->audio_n = n; }
     if (!e) return;
     static const int size[] = {4, 1, 4};
     if (e->dtype != (uint32_t)dtype || e->nbytes != n * size[dtype]) {
@@ -47,9 +51,7 @@ static void check(void *user, const char *name, int dtype, const void *data, int
             if ((a[i * 3 + 1] > 0) != (b[i * 3 + 1] > 0)) { flips++; worst = i; }
         printf("  %-40s voicing flips: %d of %d frames%s\n", "prosody[:,1]", flips, rows, flips ? " (e.g. frame shown below)" : "");
         if (worst >= 0) printf("      frame %d: engine p1 %.5f, golden p1 %.5f\n", worst, a[worst * 3 + 1], b[worst * 3 + 1]);
-        free(c->prosody); c->prosody = malloc(n * 4); memcpy(c->prosody, data, n * 4); c->prosody_rows = rows;
     }
-    if (!strcmp(name, "audio")) { free(c->audio); c->audio = malloc(n * 4); memcpy(c->audio, data, n * 4); c->audio_n = n; }
     if (dtype == TV_I8) {
         const int8_t *a = data, *b = ref;
         size_t off = 0; int worst = 0;
@@ -123,6 +125,12 @@ static void write_wav(const char *path, const float *x, int n) {
     fclose(f);
 }
 
+static const tv_entry *need(const tv_file *f, const char *name) {
+    const tv_entry *e = tv_file_find(f, name);
+    if (!e) { fprintf(stderr, "test vector has no %s\n", name); exit(1); }
+    return e;
+}
+
 int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: %s tvoca.bin test.bin out.wav [--force-durations] [--quiet]\n", argv[0]); return 2; }
     int force = 0, quiet = 0;
@@ -141,20 +149,20 @@ int main(int argc, char **argv) {
     if (tv_model_init(&model, mdata, msize)) { fprintf(stderr, "model: %s\n", model.error); return 1; }
     checker c = {.quiet = quiet};
     if (tv_file_open(&c.test, tdata, tsize)) { fprintf(stderr, "bad test vector\n"); return 1; }
-    const tv_entry *ids_e = tv_file_find(&c.test, "ids");
-    int n = ids_e->shape[0];
+    int n = need(&c.test, "ids")->shape[0];
     const int32_t *ids = tv_file_get(&c.test, "ids", TV_I32, n);
     const int32_t *stress = tv_file_get(&c.test, "stress", TV_I32, n);
     const int32_t *voice = tv_file_get(&c.test, "voice", TV_I32, 1);
     const int32_t *golden_dur = tv_file_get(&c.test, "durations", TV_I32, n);
-    const tv_entry *noise_e = tv_file_find(&c.test, "noise");
-    tv_options opt = {.speed = 1.0f, .noise = (const float *)(c.test.base + noise_e->offset),
+    const tv_entry *noise_e = need(&c.test, "noise");
+    if (!ids || !stress || !voice || (force && !golden_dur)) { fprintf(stderr, "malformed test vector\n"); return 1; }
+    tv_options opt = {.speed = 1.0f, .noise = (const float *)(c.test.base + noise_e->offset), .noise_len = noise_e->nbytes / 4,
                       .force_durations = force ? golden_dur : NULL, .debug = check, .debug_user = &c};
     if (vocoder_only) {     // golden acoustic + prosody in, compare the waveform sample by sample
-        const tv_entry *ae = tv_file_find(&c.test, "acoustic");
-        int T = ae->shape[0];
+        int T = need(&c.test, "acoustic")->shape[0];
         const float *ac = tv_file_get(&c.test, "acoustic", TV_F32, T * TV_C);
         const float *pr = tv_file_get(&c.test, "prosody", TV_F32, T * 3);
+        if (!ac || !pr || opt.noise_len < T * TV_HOP) { fprintf(stderr, "malformed test vector\n"); return 1; }
         float *audio = malloc((size_t)T * TV_HOP * sizeof(float));
         long sat = tv_vocode(&model, ac, pr, T, &opt, audio);
         printf("vocoder only: %d frames, QACC saturations %ld\n", T, sat);

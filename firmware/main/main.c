@@ -79,14 +79,17 @@ static int have_test;
 static void run_test(void) {
     if (!have_test) { printf("no test vector\n"); return; }
     const tv_entry *ids_e = tv_file_find(&test, "ids"), *noise_e = tv_file_find(&test, "noise");
-    int n = ids_e->shape[0];
+    int n = ids_e ? (int)ids_e->shape[0] : 0;
+    const int32_t *ids = tv_file_get(&test, "ids", TV_I32, n), *stress = tv_file_get(&test, "stress", TV_I32, n);
+    const int32_t *voice = tv_file_get(&test, "voice", TV_I32, 1);
     run_state st = {.golden_durations = tv_file_get(&test, "durations", TV_I32, n)};
-    tv_options opt = {.speed = 1.0f, .noise = (const float *)(test.base + noise_e->offset), .debug = on_tensor, .debug_user = &st};
+    if (!ids || !stress || !voice || !noise_e || !st.golden_durations) { printf("no test vector (testvec is not test0_dev.bin)\n"); return; }
+    tv_options opt = {.speed = 1.0f, .noise = (const float *)(test.base + noise_e->offset), .noise_len = noise_e->nbytes / 4,
+                      .debug = on_tensor, .debug_user = &st};
     tv_result r;
     tv_profile_reset();
     st.t0 = esp_timer_get_time();
-    int rc = tv_synthesize(&model, tv_file_get(&test, "ids", TV_I32, n), tv_file_get(&test, "stress", TV_I32, n), n,
-                           *(const int32_t *)tv_file_get(&test, "voice", TV_I32, 1), &opt, &r);
+    int rc = tv_synthesize(&model, ids, stress, n, *voice, &opt, &r);
     double ms = (esp_timer_get_time() - st.t0) / 1000.0;
     if (rc) { printf("synthesize failed: %d\n", rc); return; }
     double audio_ms = 1000.0 * r.n_samples / TV_SAMPLE_RATE;
@@ -98,8 +101,7 @@ static void run_test(void) {
         o2.debug = NULL;
         tv_result r2;
         int64_t t1 = esp_timer_get_time();
-        if (tv_synthesize(&model, tv_file_get(&test, "ids", TV_I32, n), tv_file_get(&test, "stress", TV_I32, n), n,
-                          *(const int32_t *)tv_file_get(&test, "voice", TV_I32, 1), &o2, &r2) == 0) {
+        if (tv_synthesize(&model, ids, stress, n, *voice, &o2, &r2) == 0) {
             int same = r2.n_samples == r.n_samples && !memcmp(r2.audio, r.audio, (size_t)r.n_samples * 4);
             printf("production path: %.0f ms, audio %s\n", (esp_timer_get_time() - t1) / 1000.0, same ? "bit-identical" : "DIFFERS");
             tv_free(r2.audio); tv_free(r2.durations);
@@ -111,6 +113,8 @@ static void run_test(void) {
     tv_free(r.audio); tv_free(r.durations);
     printf("TVDUMP_DONE\n");
 }
+
+static int frame_budget(long extra_per_frame, long largest_per_frame);
 
 // SYN <voice> <seed> <n> <id,id,...> <stress,stress,...>
 static void run_syn(char *line) {
@@ -124,13 +128,17 @@ static void run_syn(char *line) {
     char *tok = rest ? strtok(rest + 1, " ") : NULL;
     char *ids_s = tok, *str_s = tok ? strtok(NULL, " \r\n") : NULL;
     int ok = ids_s && str_s;
-    for (int i = 0; ok && i < n; i++) {
-        ids[i] = strtol(ids_s, &ids_s, 10); if (*ids_s == ',') ids_s++;
-        stress[i] = strtol(str_s, &str_s, 10); if (*str_s == ',') str_s++;
-        ok = ids[i] >= 0 && ids[i] < 76 && stress[i] >= 0 && stress[i] < 3;
+    for (int i = 0; ok && i < n; i++) {     // exactly n comma-separated values in each list
+        char *a = ids_s, *b = str_s;
+        ids[i] = strtol(a, &ids_s, 10);
+        stress[i] = strtol(b, &str_s, 10);
+        ok = ids_s != a && str_s != b && ids[i] >= 0 && ids[i] < 76 && stress[i] >= 0 && stress[i] < 3;
+        if (ok && i < n - 1) { ok = *ids_s == ',' && *str_s == ','; ids_s++; str_s++; }
     }
+    if (ok) ok = !*ids_s && !*str_s;
     if (!ok) { printf("ERR bad tokens\n"); tv_free(ids); tv_free(stress); return; }
-    tv_options opt = {.speed = 1.0f, .seed = seed};
+    // The whole audio is kept (float, then 16-bit): 1.5 KB per frame more than streaming, in one buffer.
+    tv_options opt = {.speed = 1.0f, .seed = seed, .max_frames = frame_budget(1536, 1100)};
     tv_result r;
     tv_profile_reset();
     int64_t t0 = esp_timer_get_time();
@@ -154,11 +162,12 @@ static void run_syn(char *line) {
 // Frames that fit in the free PSRAM: ~2.7 KB per frame at the peak (tiled stacks, streaming
 // vocoder) plus ~0.7 MB of fixed tile and vocoder buffers; the largest single buffer is
 // T x 768 bytes. The model itself handles at most 3000 frames.
-static int frame_budget(void) {
+// extra_per_frame: memory the caller keeps per frame beyond that; largest_per_frame: its biggest buffer.
+static int frame_budget(long extra_per_frame, long largest_per_frame) {
     long total = (long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM) - 1200 * 1024;
     long largest = (long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) - 64 * 1024;
-    long frames = total / 2900;
-    if (largest / 800 < frames) frames = largest / 800;
+    long frames = total / (2900 + extra_per_frame);
+    if (largest / largest_per_frame < frames) frames = largest / largest_per_frame;
     if (frames > 3000) frames = 3000;
     return frames > 0 ? (int)frames : 0;
 }
@@ -236,8 +245,8 @@ static int say_piece(char *text, int voice, unsigned seed, int depth) {
         stream_state st = {0};
         board_show_text(text);
         tv_profile_reset();
-        tv_options opt = {.speed = 1.0f, .seed = seed, .max_frames = frame_budget(), .on_audio = on_audio, .audio_user = &st};
-        tv_result r;
+        tv_options opt = {.speed = 1.0f, .seed = seed, .max_frames = frame_budget(0, 800), .on_audio = on_audio, .audio_user = &st};
+        tv_result r = {0};
         int64_t t0 = esp_timer_get_time();
         int rc = n > 0 ? tv_synthesize(&model, ids, stress, n, voice, &opt, &r) : TV_TOO_LONG;
         if (rc == 0) {
@@ -258,7 +267,8 @@ static int say_piece(char *text, int voice, unsigned seed, int depth) {
                 return 0;
             }
         }
-        printf("  too long for memory (%d frames, budget %d): %s\n", r.n_frames, opt.max_frames, text);
+        if (n < 0) printf("  cannot phonemize: %s (%s)\n", tvp_error(), text);
+        else printf("  too long for memory (%d frames, budget %d): %s\n", r.n_frames, opt.max_frames, text);
         return -1;
     }
     printf("  cannot phonemize: %s (%s)\n", tvp_error(), text);
@@ -267,13 +277,15 @@ static int say_piece(char *text, int voice, unsigned seed, int depth) {
 
 static int voice_id = 1;      // M2
 
-static void say(char *line) {
-    static char buf[2048];
-    snprintf(buf, sizeof buf - 2, "%s", line);
+static void say(const char *line) {
+    size_t len = strlen(line);
+    char *buf = tv_alloc(len + 2);          // the whole line (a fixed buffer cut it), + 1 for tv_finish_text
+    memcpy(buf, line, len + 1);
     tv_finish_text(buf);
     char *parts[64];
     int k = tv_split_sentences(buf, parts, 64);
     for (int i = 0; i < k; i++) say_piece(parts[i], voice_id, (unsigned)i, 0);
+    tv_free(buf);
 }
 
 // Line input with echo and backspace (works in idf.py monitor and from scripts).

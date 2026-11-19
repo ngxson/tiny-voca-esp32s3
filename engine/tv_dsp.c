@@ -3,8 +3,13 @@
 #include "tv.h"
 #include "tv_kernels.h"
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef M_PI                        // not in strict C (the host build uses -std=c11)
+#define M_PI 3.14159265358979323846
+#endif
 
 #define SYNTH_FFT 512
 #define SYNTH_HOP 128
@@ -14,6 +19,13 @@
 #define CEP_ANTI 16
 #define NOISE_CEP 32
 #define HARMONIC_LIMIT 0.47
+
+// malloc (same placement as before), with out of memory a clean abort instead of a NULL dereference.
+static void *checked_malloc(size_t n) {
+    void *p = malloc(n);
+    if (!p) { fprintf(stderr, "tv: out of memory (%u bytes)\n", (unsigned)n); abort(); }
+    return p;
+}
 
 // ---------------------------------------------------------------- fast float math
 // exp: Cody-Waite reduction + degree-6 polynomial (~2 ulp). sincos: quadrant reduction + minimax.
@@ -54,9 +66,9 @@ static const fft_plan *plan_for(int n) {           // n = real size (256 or 512)
     int m = n / 2;
     fft_plan *p = &plans[m == 256];
     if (p->m == m) return p;
-    p->tw_re = malloc(m / 2 * sizeof(float)); p->tw_im = malloc(m / 2 * sizeof(float));
-    p->rw_re = malloc((m + 1) * sizeof(float)); p->rw_im = malloc((m + 1) * sizeof(float));
-    p->rev = malloc(m * sizeof(uint16_t));
+    p->tw_re = checked_malloc(m / 2 * sizeof(float)); p->tw_im = checked_malloc(m / 2 * sizeof(float));
+    p->rw_re = checked_malloc((m + 1) * sizeof(float)); p->rw_im = checked_malloc((m + 1) * sizeof(float));
+    p->rev = checked_malloc(m * sizeof(uint16_t));
     for (int j = 0; j < m / 2; j++) { p->tw_re[j] = (float)cos(-2 * M_PI * j / m); p->tw_im[j] = (float)sin(-2 * M_PI * j / m); }
     for (int k = 0; k <= m; k++) { p->rw_re[k] = (float)cos(-2 * M_PI * k / n); p->rw_im[k] = (float)sin(-2 * M_PI * k / n); }
     int bits = 0;
@@ -217,6 +229,7 @@ typedef struct {
     float fifo[FIFO_SIZE];
     int count;                  // samples waiting in fifo
     int produced;               // samples ever appended to fifo
+    uint64_t t_cep, t_shape;    // profile of this branch (its own core), added up after the run
 } branch;
 
 typedef struct {
@@ -281,8 +294,8 @@ static void branch_step(branch *b, sources *src) {
     }
     uint64_t t0 = tv_time_us();
     response(b, src, m);
-    tv_prof[TV_P_VOC_CEP] += tv_time_us() - t0;
-    t0 = tv_time_us();
+    uint64_t t1 = tv_time_us();
+    b->t_cep += t1 - t0;
     for (int i = 0; i < fft_n; i++) b->seg[i] = b->win[i] * b->window[i];
     rfft(b->seg, fft_n, b->re, b->im, b->tr, b->ti);
     for (int k = 0; k < b->bins; k++) {
@@ -306,7 +319,7 @@ static void branch_step(branch *b, sources *src) {
     memset(b->ola + fft_n - hop, 0, hop * sizeof(float));
     memset(b->env + fft_n - hop, 0, hop * sizeof(float));
     b->m++;
-    tv_prof[TV_P_VOC_SHAPE] += tv_time_us() - t0;
+    b->t_shape += tv_time_us() - t1;
 }
 
 typedef struct {
@@ -323,8 +336,8 @@ static void branch_run(void *arg) {
 void tv_vocoder_stream(const float *h, const float *n, const float *f0, const float *noise, uint64_t seed, int T,
                        tv_audio_fn sink, void *user) {
     const int S = T * TV_HOP;
-    branch *hb = malloc(sizeof(branch)), *nb = malloc(sizeof(branch));
-    float *out = malloc(VOC_BLOCK * sizeof(float));
+    branch *hb = checked_malloc(sizeof(branch)), *nb = checked_malloc(sizeof(branch));
+    float *out = checked_malloc(VOC_BLOCK * sizeof(float));
     sources src = {h, n, T, {f0, T, 0, 0, 0, 0}, noise, 0x9E3779B97F4A7C15ULL ^ (seed << 1 | 1), 0};
     branch_init(hb, SYNTH_FFT, SYNTH_HOP, 1, S);
     branch_init(nb, NOISE_FFT, NOISE_HOP, 0, S);
@@ -341,6 +354,8 @@ void tv_vocoder_stream(const float *h, const float *n, const float *f0, const fl
         sink(user, out, k);
         emitted += k;
     }
+    tv_prof[TV_P_VOC_CEP] += hb->t_cep + nb->t_cep;      // added here: the branches run on both cores
+    tv_prof[TV_P_VOC_SHAPE] += hb->t_shape + nb->t_shape;
     free(hb); free(nb); free(out);
 }
 
